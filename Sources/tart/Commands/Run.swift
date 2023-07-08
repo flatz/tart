@@ -4,10 +4,15 @@ import Dispatch
 import SwiftUI
 import Virtualization
 import Sentry
+import Dynamic
 
 var vm: VM?
 
 struct IPNotFound: Error {
+}
+
+enum SerialType: String, ExpressibleByArgument, CaseIterable {
+  case virtio, pl011
 }
 
 struct Run: AsyncParsableCommand {
@@ -21,22 +26,34 @@ struct Run: AsyncParsableCommand {
     discussion: "Useful for integrating Tart VMs into other tools.\nUse `tart ip` in order to get an IP for SSHing or VNCing into the VM."))
   var noGraphics: Bool = false
 
-  @Flag(help: ArgumentHelp(
-    "Open serial console in /dev/ttySXX",
-    discussion: "Useful for debugging Linux Kernel."))
-  var serial: Bool = false
+  @Option(help: ArgumentHelp(
+    "Specify serial console type (allowed: \(SerialType.allValueStrings.joined(separator: ", ")))",
+    discussion: "Useful for debugging kernels."))
+  var serialType: SerialType?
 
   @Option(help: ArgumentHelp(
     "Attach an externally created serial console",
-    discussion: "Alternative to `--serial` flag for programmatic integrations."
+    discussion: "Used along with `--serial-type virtio` for programmatic integrations."
   ))
   var serialPath: String?
 
   @Flag(help: "Force open a UI window, even when VNC is enabled.")
   var graphics: Bool = false
 
-  @Flag(help: "Boot into recovery mode")
+  @Flag(help: "Boot into Recovery mode")
   var recovery: Bool = false
+
+  @Flag(help: "Boot into DFU mode") 
+  var dfu: Bool = false
+
+  @Flag(help: "Halt when panicked") 
+  var stopOnPanic: Bool = false
+
+  @Flag(help: "Halt when loading iBootStage1") 
+  var stopInIBootStage1: Bool = false
+
+  @Flag(help: "Halt when loading iBootStage2") 
+  var stopInIBootStage2: Bool = false
 
   @Flag(help: ArgumentHelp(
     "Use screen sharing instead of the built-in UI.",
@@ -157,21 +174,29 @@ struct Run: AsyncParsableCommand {
     }
 
     var serialPorts: [VZSerialPortConfiguration] = []
-    if serial {
-      let tty_fd = createPTY()
-      if (tty_fd < 0) {
-        throw RuntimeError.VMConfigurationError("Failed to create PTY")
+    if serialType == SerialType.virtio {
+      if serialPath != nil {
+          let tty_read = FileHandle.init(forReadingAtPath: serialPath!)
+          let tty_write = FileHandle.init(forWritingAtPath: serialPath!)
+
+          if (tty_read == nil || tty_write == nil) {
+              throw RuntimeError.VMConfigurationError("Failed to open PTY")
+          }
+
+          serialPorts.append(createVirtioSerialPortConfiguration(tty_read!, tty_write!))
+      } else {
+          let tty_fd = createPTY()
+          if (tty_fd < 0) {
+              throw RuntimeError.VMConfigurationError("Failed to create PTY")
+          }
+
+          let tty_read = FileHandle.init(fileDescriptor: tty_fd)
+          let tty_write = FileHandle.init(fileDescriptor: tty_fd)
+
+          serialPorts.append(createVirtioSerialPortConfiguration(tty_read, tty_write))
       }
-      let tty_read = FileHandle.init(fileDescriptor: tty_fd)
-      let tty_write = FileHandle.init(fileDescriptor: tty_fd)
-      serialPorts.append(createSerialPortConfiguration(tty_read, tty_write))
-    } else if serialPath != nil {
-      let tty_read = FileHandle.init(forReadingAtPath: serialPath!)
-      let tty_write = FileHandle.init(forWritingAtPath: serialPath!)
-      if (tty_read == nil || tty_write == nil) {
-        throw RuntimeError.VMConfigurationError("Failed to open PTY")
-      }
-      serialPorts.append(createSerialPortConfiguration(tty_read!, tty_write!))
+    } else if serialType == SerialType.pl011 {
+        serialPorts.append(createPL011SerialPortConfiguration())
     }
 
     vm = try VM(
@@ -229,7 +254,7 @@ struct Run: AsyncParsableCommand {
 
         var resume = false
 
-        if #available(macOS 14, *) {
+        if #available(macOS 14.0, *) {
           if FileManager.default.fileExists(atPath: vmDir.stateURL.path) {
             print("restoring VM state from a snapshot...")
             try await vm!.virtualMachine.restoreMachineStateFrom(url: vmDir.stateURL)
@@ -239,7 +264,16 @@ struct Run: AsyncParsableCommand {
           }
         }
 
-        try await vm!.run(recovery: recovery, resume: resume)
+        let startOptions = VMStartOptions(
+          startUpFromMacOSRecovery: recovery,
+          restoreVMState: resume,
+          forceDFU: dfu,
+          stopOnPanic: stopOnPanic,
+          stopInIBootStage1: stopInIBootStage1,
+          stopInIBootStage2: stopInIBootStage2
+        )
+
+        try await vm!.run(startOptions)
 
         if let vncImpl = vncImpl {
           try vncImpl.stop()
@@ -270,7 +304,7 @@ struct Run: AsyncParsableCommand {
     sigusr1Src.setEventHandler {
       Task {
         do {
-          if #available(macOS 14, *) {
+          if #available(macOS 14.0, *) {
             try vm!.configuration.validateSaveRestoreSupport()
 
             print("pausing VM to take a snapshot...")
@@ -304,13 +338,23 @@ struct Run: AsyncParsableCommand {
     }
   }
 
-  private func createSerialPortConfiguration(_ tty_read: FileHandle, _ tty_write: FileHandle) -> VZVirtioConsoleDeviceSerialPortConfiguration {
+  private func createVirtioSerialPortConfiguration(_ tty_read: FileHandle, _ tty_write: FileHandle) -> VZSerialPortConfiguration {
     let serialPortConfiguration = VZVirtioConsoleDeviceSerialPortConfiguration()
-    let serialPortAttachment = VZFileHandleSerialPortAttachment(
-      fileHandleForReading: tty_read,
-      fileHandleForWriting: tty_write)
 
-    serialPortConfiguration.attachment = serialPortAttachment
+    serialPortConfiguration.attachment = VZFileHandleSerialPortAttachment(
+        fileHandleForReading: tty_read,
+        fileHandleForWriting: tty_write)
+
+    return serialPortConfiguration
+  }
+
+  private func createPL011SerialPortConfiguration() -> VZSerialPortConfiguration {
+    let serialPortConfiguration = Dynamic._VZPL011SerialPortConfiguration().asObject as! VZSerialPortConfiguration
+
+    serialPortConfiguration.attachment = VZFileHandleSerialPortAttachment(
+        fileHandleForReading: FileHandle.standardInput,
+        fileHandleForWriting: FileHandle.standardOutput)
+
     return serialPortConfiguration
   }
 

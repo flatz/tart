@@ -1,6 +1,7 @@
 import Foundation
 import Virtualization
 import AsyncAlgorithms
+import Dynamic // TODO: Remove
 
 struct UnsupportedRestoreImageError: Error {
 }
@@ -57,7 +58,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // Initialize the virtual machine and its configuration
     self.network = network
     configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL,
-                                                nvramURL: vmDir.nvramURL, vmConfig: config,
+                                                nvramURL: vmDir.nvramURL, romURL: vmDir.romURL, vmConfig: config,
                                                 network: network, additionalDiskAttachments: additionalDiskAttachments,
                                                 directorySharingDevices: directorySharingDevices,
                                                 serialPorts: serialPorts,
@@ -137,6 +138,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     vmDir: VMDirectory,
     ipswURL: URL,
     diskSizeGB: UInt16,
+    romURL: URL,
     network: Network = NetworkShared(),
     additionalDiskAttachments: [VZDiskImageStorageDeviceAttachment] = [],
     directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
@@ -181,10 +183,13 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // allocate at least 4 CPUs because otherwise VMs are frequently freezing
     try config.setCPU(cpuCount: max(4, requirements.minimumSupportedCPUCount))
     try config.save(toURL: vmDir.configURL)
+      
+    // Copy ROM
+    try FileManager.default.copyItem(atPath: romURL.path, toPath: vmDir.romURL.path)
 
     // Initialize the virtual machine and its configuration
     self.network = network
-    configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
+    configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL, romURL: vmDir.romURL,
                                                 vmConfig: config, network: network,
                                                 additionalDiskAttachments: additionalDiskAttachments,
                                                 directorySharingDevices: directorySharingDevices,
@@ -225,13 +230,13 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     return try VM(vmDir: vmDir)
   }
 
-  func run(recovery: Bool, resume shouldResume: Bool) async throws {
+  func run(_ vmStartOptions: VMStartOptions) async throws {
     try network.run(sema)
 
-    if shouldResume {
+    if vmStartOptions.restoreVMState {
       try await resume()
     } else {
-      try await start(recovery)
+      try await start(vmStartOptions)
     }
 
     await withTaskCancellationHandler(operation: {
@@ -250,15 +255,21 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   }
 
   @MainActor
-  private func start(_ recovery: Bool) async throws {
+  private func start(_ vmStartOptions: VMStartOptions) async throws {
     if #available(macOS 13, *) {
       // new API introduced in Ventura
       let startOptions = VZMacOSVirtualMachineStartOptions()
-      startOptions.startUpFromMacOSRecovery = recovery
+      startOptions.startUpFromMacOSRecovery = vmStartOptions.startUpFromMacOSRecovery
+      // TODO: Do something with it.
+      Dynamic(startOptions)._setForceDFU(vmStartOptions.forceDFU)
+      Dynamic(startOptions)._setPanicAction(vmStartOptions.stopOnPanic)
+      Dynamic(startOptions)._setStopInIBootStage1(vmStartOptions.stopInIBootStage1)
+      Dynamic(startOptions)._setStopInIBootStage2(vmStartOptions.stopInIBootStage2)
+
       try await virtualMachine.start(options: startOptions)
     } else {
       // use method that also available on Monterey
-      try await virtualMachine.start(recovery)
+      try await virtualMachine.start(vmStartOptions.startUpFromMacOSRecovery)
     }
   }
 
@@ -275,6 +286,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   static func craftConfiguration(
     diskURL: URL,
     nvramURL: URL,
+    romURL: URL, // TODO: Can be moved to VMConfig?
     vmConfig: VMConfig,
     network: Network = NetworkShared(),
     additionalDiskAttachments: [VZDiskImageStorageDeviceAttachment],
@@ -285,7 +297,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     let configuration = VZVirtualMachineConfiguration()
 
     // Boot loader
-    configuration.bootLoader = try vmConfig.platform.bootLoader(nvramURL: nvramURL)
+    let bootloader = try vmConfig.platform.bootLoader(nvramURL: nvramURL)
+    Dynamic(bootloader)._setROMURL(romURL) // TODO: Can do something with it?
+    configuration.bootLoader = bootloader
 
     // CPU and memory
     configuration.cpuCount = vmConfig.cpuCount
@@ -338,6 +352,11 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
     // Serial Port
     configuration.serialPorts = serialPorts
+
+    // Debug port
+    // TODO: Remove Dynamic?
+    let debugStub = Dynamic._VZGDBDebugStubConfiguration(port: vmConfig.debugPort);
+    Dynamic(configuration)._setDebugStub(debugStub);
 
     try configuration.validate()
 
