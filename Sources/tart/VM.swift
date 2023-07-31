@@ -1,7 +1,7 @@
 import Foundation
 import Virtualization
 import AsyncAlgorithms
-import Dynamic // TODO: Remove
+import Dynamic
 
 struct UnsupportedRestoreImageError: Error {
 }
@@ -230,15 +230,17 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     return try VM(vmDir: vmDir)
   }
 
-  func run(_ vmStartOptions: VMStartOptions) async throws {
+  func start(_ vmStartOptions: VMStartOptions) async throws {
     try network.run(sema)
 
     if vmStartOptions.restoreVMState {
       try await resume()
     } else {
-      try await start(vmStartOptions)
+      try await coldStart(vmStartOptions)
     }
+  }
 
+  func run() async throws {
     await withTaskCancellationHandler(operation: {
       // Wait for the VM to finish running
       // or for the exit condition
@@ -255,7 +257,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   }
 
   @MainActor
-  private func start(_ vmStartOptions: VMStartOptions) async throws {
+  private func coldStart(_ vmStartOptions: VMStartOptions) async throws {
     if #available(macOS 13, *) {
       // new API introduced in Ventura
       let startOptions = VZMacOSVirtualMachineStartOptions()
@@ -357,6 +359,20 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // TODO: Remove Dynamic?
     let debugStub = Dynamic._VZGDBDebugStubConfiguration(port: vmConfig.debugPort);
     Dynamic(configuration)._setDebugStub(debugStub);
+
+    // Version console device
+    //
+    // A dummy console device useful for implementing
+    // host feature checks in the guest agent software.
+    if #available(macOS 13, *) {
+      let consolePort = VZVirtioConsolePortConfiguration()
+      consolePort.name = "tart-version-\(CI.version)"
+
+      let consoleDevice = VZVirtioConsoleDeviceConfiguration()
+      consoleDevice.ports[0] = consolePort
+
+      configuration.consoleDevices.append(consoleDevice)
+    }
 
     try configuration.validate()
 
